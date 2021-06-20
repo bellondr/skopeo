@@ -70,6 +70,7 @@ func createApp() (*cobra.Command, *globalOptions) {
 	}
 	rootCommand.PersistentFlags().StringVar(&opts.tmpDir, "tmpdir", "", "directory used to store temporary files")
 	rootCommand.AddCommand(
+		releaseVersionCmd(&opts),
 		copyCmd(&opts),
 		deleteCmd(&opts),
 		inspectCmd(&opts),

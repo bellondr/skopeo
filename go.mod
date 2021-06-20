@@ -23,3 +23,7 @@ require (
 	go4.org v0.0.0-20190218023631-ce4c26f7be8e // indirect
 	gopkg.in/yaml.v2 v2.4.0
 )
+
+replace (
+	github.com/containers/image/v5 => ../image
+)
