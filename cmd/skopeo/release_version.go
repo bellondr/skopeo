@@ -39,9 +39,12 @@ type Artifact struct {
 	Tags          []string `json:"tags"`
 }
 
+const (
+	defaultContainerAuthConfigPath = "/run/user/%d/containers/auth.json"
+)
 type ReleaseVersion struct {
 	Version   string      `json:"version"`
-	Describe  string      `json:"describe"`
+	Info  string      	  `json:"info"`
 	CreatedAt time.Time   `json:"created_at"`
 	Status    string      `json:"status"`
 	Artifacts []*Artifact `json:"artifacts"`
@@ -61,6 +64,9 @@ type dAuthConfig struct {
 type dConfigFile struct {
 	AuthConfigs map[string]dAuthConfig `json:"auths"`
 }
+func init() {
+	os.Setenv("XDG_RUNTIME_DIR", fmt.Sprintf("/run/user/%d", os.Getuid()))
+}
 
 func readJSONFile(path string) (*dConfigFile, error) {
 	data, err := ioutil.ReadFile(path)
@@ -77,6 +83,51 @@ func readJSONFile(path string) (*dConfigFile, error) {
 	}
 	return &da, nil
 }
+
+type dockerAuthConfig struct {
+	Auth          string `json:"auth,omitempty"`
+	IdentityToken string `json:"identitytoken,omitempty"`
+}
+
+type dockerConfigFile struct {
+	AuthConfigs map[string]dockerAuthConfig `json:"auths"`
+	CredHelpers map[string]string           `json:"credHelpers,omitempty"`
+}
+
+func readDockerJSONFile(path string, legacyFormat bool) (*dockerConfigFile, error) {
+	auths := &dockerConfigFile{}
+
+	raw, err := ioutil.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("path: %s is empty \n",  path)
+			auths.AuthConfigs = map[string]dockerAuthConfig{}
+			return auths, nil
+		}
+		return &dockerConfigFile{}, err
+	}
+
+	if legacyFormat {
+		if err = json.Unmarshal(raw, &auths.AuthConfigs); err != nil {
+			return &dockerConfigFile{}, errors.Wrapf(err, "error unmarshaling JSON at %q", path)
+		}
+		return auths, nil
+	}
+
+	if err = json.Unmarshal(raw, &auths); err != nil {
+		return &dockerConfigFile{}, errors.Wrapf(err, "error unmarshaling JSON at %q", path)
+	}
+
+	if auths.AuthConfigs == nil {
+		auths.AuthConfigs = map[string]dockerAuthConfig{}
+	}
+	if auths.CredHelpers == nil {
+		auths.CredHelpers = make(map[string]string)
+	}
+
+	return auths, nil
+}
+
 
 type ReleaseVersionOptions struct {
 	rootPath          string
@@ -166,6 +217,18 @@ func (opts *ReleaseVersionOptions) getAuthToken()  error {
 		if strings.Contains(opts.srcUri, k) {
 			authToken = v.Auth
 			break
+		}
+	}
+	if authToken == "" {
+		dockerAuthConfig, err := readDockerJSONFile(fmt.Sprintf(defaultContainerAuthConfigPath, os.Getuid()), false)
+		if err != nil {
+			return err
+		}
+		for k, v := range dockerAuthConfig.AuthConfigs {
+			if strings.Contains(opts.srcUri, k) {
+				authToken = v.Auth
+				break
+			}
 		}
 	}
 	bt := BearerToken{}
@@ -465,7 +528,7 @@ func printReleaseVersions(rvs []*ReleaseVersion) {
 func printReleaseVersion(rv *ReleaseVersion) {
 	fmt.Printf("Version:  %s \n", rv.Version)
 	fmt.Printf("Status:   %s \n", rv.Status)
-	fmt.Printf("Describe: %s \n", rv.Status)
+	fmt.Printf("Info: 	 %s \n", rv.Info)
 	fmt.Printf("Artifacts: \n")
 	for _, art := range rv.Artifacts {
 		if art.Type == "DOCKER-IMAGE" {
