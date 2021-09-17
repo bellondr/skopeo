@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/containers/skopeo/common/reqcli"
-	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"io"
@@ -29,18 +28,26 @@ import (
 	"github.com/spf13/cobra"
 )
 
+
 type Artifact struct {
 	ID             uint       `json:"ID"`
 	RepositoryName string    `json:"repository_name,omitempty"`
 	Type           string    `json:"type"`
 	MetaData       string    `json:"meta_data,omitempty"`
 	Digest         string    `json:"digest,omitempty"`
+	OriDigest      string    `json:"ori_digest"`
 	NamespaceName string   `json:"namespace_name"`
 	Tags          []string `json:"tags"`
+	Name       		string `json:"name"`
+	FilePath   	   string `json:"file_path"`
 }
+
+var pwd, _ = os.Getwd()
 
 const (
 	defaultContainerAuthConfigPath = "/run/user/%d/containers/auth.json"
+	dockerImage = "DOCKER-IMAGE"
+	dirType     = "dir"
 )
 type ReleaseVersion struct {
 	Version   string      `json:"version"`
@@ -130,15 +137,18 @@ func readDockerJSONFile(path string, legacyFormat bool) (*dockerConfigFile, erro
 
 
 type ReleaseVersionOptions struct {
-	rootPath          string
 	global            *globalOptions
 	srcImage          *imageOptions
 	destImage         *imageDestOptions
 	retryOpts         *retry.RetryOptions
 	version           string
-	srcUri            string
-	destUri           string
-	action			  string
+	token             string
+	src               string
+	dest              string
+	srcType           string
+	destType          string
+	destPath          string
+	action            string
 	removeSignatures  bool           // Do not copy signatures from the source image
 	signByFingerprint string         // Sign the image using a GPG key with the specified fingerprint
 	digestFile        string         // Write digest to this file
@@ -180,13 +190,17 @@ func releaseVersionCmd(global *globalOptions) *cobra.Command {
 	flags.AddFlagSet(&srcFlags)
 	flags.AddFlagSet(&destFlags)
 
-	flags.StringVar(&rvOpt.srcUri, "src", "", "The release version src url")
-	flags.StringVar(&rvOpt.destUri, "dest", "", "The release version dest url")
+	flags.StringVar(&rvOpt.srcType, "src-type", "", "src-type: such as docker, dir, oci, default docker")
+	flags.StringVar(&rvOpt.src, "src", "", "The release version src url")
+	flags.StringVar(&rvOpt.dest, "dest", "", "The release version dest url")
+	flags.StringVar(&rvOpt.destType, "dest-type", "", "dest-type: such as docker, dir, oci, default docker")
+
 	flags.StringVar(&rvOpt.version, "version", "", "the release version")
+	flags.StringVar(&rvOpt.token, "token", "", "oauth token")
 	flags.StringVar(&rvOpt.action, "action", "", "cmd action")
 	flags.BoolVar(&rvOpt.removeSignatures, "remove-signatures", false, "Do not copy signatures from SOURCE-IMAGE")
 	flags.StringVar(&rvOpt.signByFingerprint, "sign-by", "", "Sign the image using a GPG key with the specified `FINGERPRINT`")
-	flags.StringVar(&rvOpt.rootPath, "root-path", "binary-data", "binary artifacts root path")
+	flags.StringVar(&rvOpt.destPath, "dest-path", "", "The dest path to storage non docker image data")
 	flags.BoolVar(&rvOpt.enableHttp, "http", false, "use http")
 	if rvOpt.enableHttp {
 		rvOpt.httpSchema = "http"
@@ -202,7 +216,7 @@ type BearerToken struct {
 	expirationTime time.Time
 }
 
-func (opts *ReleaseVersionOptions) getAuthToken()  error {
+func (opts *ReleaseVersionOptions) getAuthToken() error {
 	cli := reqcli.GetDefaultHttpClient()
 	ud, err := os.UserHomeDir()
 	if err != nil {
@@ -214,7 +228,7 @@ func (opts *ReleaseVersionOptions) getAuthToken()  error {
 	}
 	authToken := ""
 	for k, v := range da.AuthConfigs {
-		if strings.Contains(opts.srcUri, k) {
+		if strings.Contains(opts.src, k) {
 			authToken = v.Auth
 			break
 		}
@@ -225,7 +239,7 @@ func (opts *ReleaseVersionOptions) getAuthToken()  error {
 			return err
 		}
 		for k, v := range dockerAuthConfig.AuthConfigs {
-			if strings.Contains(opts.srcUri, k) {
+			if strings.Contains(opts.src, k) {
 				authToken = v.Auth
 				break
 			}
@@ -235,7 +249,7 @@ func (opts *ReleaseVersionOptions) getAuthToken()  error {
 
 	checkReq, err := http.NewRequestWithContext(context.TODO(),
 		http.MethodGet,
-		fmt.Sprintf("%s://%s/api/v1/check_alive", opts.httpSchema, opts.srcUri), nil)
+		fmt.Sprintf("%s://%s/api/v1/check_alive", opts.httpSchema, opts.src), nil)
 	if err != nil {
 		return err
 	}
@@ -246,7 +260,7 @@ func (opts *ReleaseVersionOptions) getAuthToken()  error {
 
 	authReq, err := http.NewRequestWithContext(context.TODO(),
 		http.MethodGet,
-		fmt.Sprintf("%s://%s/api/v1/token", opts.httpSchema, opts.srcUri), nil)
+		fmt.Sprintf("%s://%s/api/v1/token", opts.httpSchema, opts.src), nil)
 	if err != nil {
 		return err
 	}
@@ -263,46 +277,88 @@ func (opts *ReleaseVersionOptions) getAuthToken()  error {
 	return nil
 }
 
-func (opts *ReleaseVersionOptions) run(args []string, stdout io.Writer) error {
-	err := opts.getAuthToken()
-	if err != nil {
-		return err
+func (opts *ReleaseVersionOptions) clearDestDir() {
+	if opts.destType == dirType {
+		pa := opts.getReleaseVersionPath(false)
+		os.RemoveAll(pa)
+	}
+}
+
+func (opts *ReleaseVersionOptions) getSrcReleaseVersion() (*ReleaseVersion, error) {
+	data := []byte{}
+	if opts.srcType == dirType {
+		rPath := opts.getReleaseVersionPath(true)
+		rConfPath := filepath.Join(rPath, fmt.Sprintf("%s.json", opts.version))
+		var err error
+		data, err = ioutil.ReadFile(rConfPath)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cli := reqcli.GetDefaultHttpClient()
+		req, err := http.NewRequestWithContext(context.TODO(),
+			http.MethodGet,
+			fmt.Sprintf("%s://%s/api/v1/release-versions/%s", opts.httpSchema, opts.src, opts.version), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", opts.bearerToken.Token))
+		resp, err := cli.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			logrus.Errorf("get version %s resp status is: %d ", opts.version, resp.StatusCode)
+			return nil, fmt.Errorf("get version %s resp status is: %d", opts.version, resp.StatusCode)
+		}
+
+		data, err = ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
 	}
 
+	releaseVersion := ReleaseVersion{}
+	if err := json.Unmarshal(data, &releaseVersion); err != nil {
+		return nil, errors.Wrapf(err, "json decode release version")
+	}
+	return &releaseVersion, nil
+}
+
+func (opts *ReleaseVersionOptions) prepare() error {
+	if opts.srcType != dirType {
+		if opts.token != "" {
+			opts.bearerToken = &BearerToken{
+				Token: opts.token,
+				AccessToken: opts.token,
+			}
+			return nil
+		}
+		err := opts.getAuthToken()
+		if err != nil {
+			return err
+		}
+	}
+	opts.clearDestDir()
+	return nil
+}
+
+func (opts *ReleaseVersionOptions) run(args []string, stdout io.Writer) error {
+	if err := opts.prepare(); err != nil {
+		return err
+	}
 	if opts.action == "list" {
 		return opts.listReleaseVersion(args, stdout)
 	}
 
-	cli := reqcli.GetDefaultHttpClient()
-	req, err := http.NewRequestWithContext(context.TODO(),
-		http.MethodGet,
-		fmt.Sprintf("%s://%s/api/v1/release-versions/%s", opts.httpSchema, opts.srcUri, opts.version), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", opts.bearerToken.Token))
-	resp, err := cli.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		logrus.Errorf("get version %s resp status is: %d ", opts.version, resp.StatusCode)
-		return fmt.Errorf("get version %s resp status is: %d", opts.version, resp.StatusCode)
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	releaseVersion := ReleaseVersion{}
-	if err := json.Unmarshal(body, &releaseVersion); err != nil {
-		stdout.Write([]byte(fmt.Sprintf("json decode view release version: %+v", err)))
-		return errors.Wrapf(err, "json decode view release version")
-	}
-
 	ctx, cancel := opts.global.commandTimeoutContext()
 	defer cancel()
+
+	releaseVersion, err := opts.getSrcReleaseVersion()
+	if err != nil {
+		return err
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(len(releaseVersion.Artifacts))
@@ -317,7 +373,7 @@ func (opts *ReleaseVersionOptions) run(args []string, stdout io.Writer) error {
 				}
 			}()
 			var err error
-			if arti.Type != "DOCKER-IMAGE" {
+			if arti.Type != dockerImage {
 				err = opts.copyBinaryArtifact(ctx, arti, stdout)
 			} else {
 				err = opts.copyDockerArtifact(ctx, arti, stdout)
@@ -328,7 +384,6 @@ func (opts *ReleaseVersionOptions) run(args []string, stdout io.Writer) error {
 		}(ctx, arti, stdout)
 	}
 	wg.Wait()
-
 	for _, e := range opts.errors {
 		if e != nil {
 			stdout.Write([]byte(fmt.Sprintf("%+v", e)))
@@ -339,24 +394,18 @@ func (opts *ReleaseVersionOptions) run(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	wd, _ := json.Marshal(&releaseVersion)
-	ioutil.WriteFile(fmt.Sprintf("%s.json", opts.version), wd, 644)
-	printReleaseVersions([]*ReleaseVersion{&releaseVersion})
+	data, _ := json.Marshal(releaseVersion)
+	ioutil.WriteFile(fmt.Sprintf("%s/%s.json", opts.getReleaseVersionPath(false), opts.version), data, 0644)
+	printReleaseVersions([]*ReleaseVersion{releaseVersion})
 	return  nil
 }
 
 func (opts *ReleaseVersionOptions) copyBinaryArtifact(ctx context.Context, artifact *Artifact, stdout io.Writer) error {
-	dataPath := opts.getArtifactBinaryPath(artifact)
-	_, err := os.Stat(dataPath)
-	if err == nil {
-		fmt.Printf("data path: %s exist \n", dataPath)
-		return nil
-	}
+	dataPath := opts.getAndPrepareArtifactPath(artifact, false)
 	cli := reqcli.GetDefaultHttpClient()
-
 	req, err := http.NewRequestWithContext(context.TODO(),
 		http.MethodGet,
-		fmt.Sprintf("%s://%s/api/v1/artifactEncrypt/%d", opts.httpSchema, opts.srcUri, artifact.ID), nil)
+		fmt.Sprintf("%s://%s/api/v1/artifactEncrypt/%d", opts.httpSchema, opts.src, artifact.ID), nil)
 	if err != nil {
 		return err
 	}
@@ -369,7 +418,7 @@ func (opts *ReleaseVersionOptions) copyBinaryArtifact(ctx context.Context, artif
 
 	req, err = http.NewRequestWithContext(context.TODO(),
 		http.MethodGet,
-		fmt.Sprintf("%s://%s/api/v1/artifactDownload/%d", opts.httpSchema, opts.srcUri, artifact.ID), nil)
+		fmt.Sprintf("%s://%s/api/v1/artifactDownload/%d", opts.httpSchema, opts.src, artifact.ID), nil)
 	if err != nil {
 		return err
 	}
@@ -388,10 +437,6 @@ func (opts *ReleaseVersionOptions) copyBinaryArtifact(ctx context.Context, artif
 	if err != nil {
 		return err
 	}
-	parentDir := path.Dir(dataPath)
-	if err = os.MkdirAll(parentDir, 0777); err != nil {
-		return err
-	}
 	if ba := strings.TrimSpace(resp.Header.Get("Blob-AESKey")); ba != "" {
 		encryptKey = ba
 	}
@@ -403,8 +448,6 @@ func (opts *ReleaseVersionOptions) copyBinaryArtifact(ctx context.Context, artif
 	if err != nil {
 		return err
 	}
-
-	fmt.Printf("artifact %s, key: %s nonce: %s \n", artifact.RepositoryName, aesKey, nonce)
 
 	key, err := hex.DecodeString(aesKey)
 	if err != nil {
@@ -446,15 +489,22 @@ func (opts *ReleaseVersionOptions) copyDockerArtifact(ctx context.Context, artif
 	if len(artifact.Tags) > 0 {
 		tag = artifact.Tags[0]
 	}
-	srcImage := fmt.Sprintf("docker://%s/%s:%s", opts.srcUri, artifact.RepositoryName, tag)
+
+	srcImage := fmt.Sprintf("docker://%s/%s:%s", opts.src, artifact.RepositoryName, tag)
+	if opts.srcType == dirType {
+		srcImage = fmt.Sprintf("dir:%s", opts.getArtifactPath(artifact, true))
+	}
 	srcRef, err := alltransports.ParseImageName(srcImage)
 	if err != nil {
-		return fmt.Errorf("Invalid source name %s: %v", srcImage, err)
+		return errors.Wrapf(err, "failed to parse image name: %s", srcImage)
 	}
-	destImage := fmt.Sprintf("docker://%s/%s:%s", opts.destUri, artifact.RepositoryName, tag)
+	destImage := fmt.Sprintf("docker://%s/%s:%s", opts.dest, artifact.RepositoryName, tag)
+	if opts.destType == dirType {
+		destImage = fmt.Sprintf("dir:%s", opts.getAndPrepareArtifactPath(artifact, false))
+	}
 	destRef, err := alltransports.ParseImageName(destImage)
 	if err != nil {
-		return fmt.Errorf("Invalid destination name %s: %v", destRef, err)
+		return errors.Wrapf(err, "failed to parse image name: %s", destImage)
 	}
 	sourceCtx, err := opts.srcImage.newSystemContext()
 	if err != nil {
@@ -491,28 +541,56 @@ func (opts *ReleaseVersionOptions) copyDockerArtifact(ctx context.Context, artif
 }
 
 func (opts *ReleaseVersionOptions) listReleaseVersion(args []string, stdout io.Writer) error {
-	cli := reqcli.GetDefaultHttpClient()
-	req, err := http.NewRequestWithContext(context.TODO(),
-		http.MethodGet,
-		fmt.Sprintf("%s://%s/api/v1/release-versions?search=%s", opts.httpSchema, opts.srcUri, opts.version), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", opts.bearerToken.Token))
-	resp, err := cli.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		logrus.Errorf("list version %s resp status is: %d ", opts.version, resp.StatusCode)
-		return fmt.Errorf("get version %s resp status is: %d", opts.version, resp.StatusCode)
+	list := ReleaseVersionList{Items: []*ReleaseVersion{}}
+	if opts.srcType == dirType {
+		rpath := opts.getReleaseVersionPath(true)
+		parent := path.Dir(rpath)
+		files, err := ioutil.ReadDir(parent)
+		if err != nil {
+			return err
+		}
+		for i := range files {
+			if strings.Contains(files[i].Name(), opts.version) {
+				jp := filepath.Join(parent, files[i].Name(), fmt.Sprintf("%s.json", files[i].Name()))
+				_, err := os.Stat(jp)
+				if err != nil {
+					continue
+				}
+				rvData, err := ioutil.ReadFile(jp)
+				if err != nil {
+					return err
+				}
+				rv := ReleaseVersion{}
+				if err := json.Unmarshal(rvData, &rv); err != nil {
+					return err
+				}
+				list.Items = append(list.Items, &rv)
+			}
+		}
+	} else {
+		cli := reqcli.GetDefaultHttpClient()
+		req, err := http.NewRequestWithContext(context.TODO(),
+			http.MethodGet,
+			fmt.Sprintf("%s://%s/api/v1/release-versions?search=%s", opts.httpSchema, opts.src, opts.version), nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", opts.bearerToken.Token))
+		resp, err := cli.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			logrus.Errorf("list version %s resp status is: %d ", opts.version, resp.StatusCode)
+			return fmt.Errorf("get version %s resp status is: %d", opts.version, resp.StatusCode)
+		}
+
+		if err = json.NewDecoder(resp.Body).Decode(&list); err != nil {
+			return err
+		}
 	}
 
-	list := ReleaseVersionList{}
-	if err = json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return err
-	}
 	printReleaseVersions(list.Items)
 	return nil
 }
@@ -546,6 +624,9 @@ func printReleaseVersion(rv *ReleaseVersion) {
 		} else {
 			fmt.Printf("    binary: %s \n", art.RepositoryName)
 			fmt.Printf("    digest: %s \n", art.Digest)
+			if art.OriDigest != "" {
+				fmt.Printf("    ori digest: %s \n", art.OriDigest)
+			}
 			fmt.Println()
 		}
 	}
@@ -565,10 +646,65 @@ func (opts *ReleaseVersionOptions) addError(err error) {
 	opts.lock.Unlock()
 }
 
-func (opts *ReleaseVersionOptions) getArtifactBinaryPath(artifact *Artifact) string {
-	dig, err := digest.Parse(artifact.Digest)
-	if err != nil {
-		return filepath.Join(opts.rootPath, "sha256", artifact.Digest[0:2], artifact.Digest, artifact.RepositoryName)
+func (opts *ReleaseVersionOptions) getReleaseVersionPath(isSrc bool) string {
+	if isSrc {
+		return filepath.Join(opts.src, "release-version", opts.version)
 	}
-	return  filepath.Join(opts.rootPath, dig.Algorithm().String(), dig.Encoded()[0:2], dig.Encoded(), artifact.RepositoryName)
+	if opts.destType == dirType {
+		return filepath.Join(opts.dest, "release-version", opts.version)
+	}
+	rp := opts.destPath
+	if rp == "" {
+		rp = pwd
+	}
+	return filepath.Join(rp, "release-version", opts.version)
+}
+
+func (opts *ReleaseVersionOptions) getAndPrepareArtifactPath(artifact *Artifact, isSrc bool) string {
+	p := opts.getArtifactPath(artifact, isSrc)
+	os.RemoveAll(p)
+	if artifact.Type == dockerImage {
+		os.MkdirAll(p, 0777)
+	} else {
+		parentDir := path.Dir(p)
+		os.MkdirAll(parentDir, 0777)
+	}
+	return p
+}
+
+func (opts *ReleaseVersionOptions) getArtifactPath(artifact *Artifact,isSrc bool) string {
+	p := "images"
+	if artifact.Type != dockerImage {
+		p = "binary"
+	}
+
+	if isSrc {
+		return filepath.Join(opts.src, "release-version", opts.version, p, opts.getArtifactName(artifact))
+	}
+	if opts.destType == dirType {
+		return filepath.Join(opts.dest, "release-version", opts.version, p, opts.getArtifactName(artifact))
+	}
+	rp := opts.destPath
+	if rp == "" {
+		rp = pwd
+	}
+	return filepath.Join(rp, "release-version", opts.version, p, opts.getArtifactName(artifact))
+}
+
+func (opts *ReleaseVersionOptions) getArtifactName(arti *Artifact) string {
+	if arti.Type != dockerImage {
+		if arti.FilePath != "" {
+			return arti.FilePath
+		}
+		if arti.Name != "" {
+			return arti.Name
+		}
+		return arti.RepositoryName
+	}
+
+	tag := "latest"
+	if len(arti.Tags) > 0 {
+		tag = arti.Tags[0]
+	}
+	return fmt.Sprintf("%s:%s", arti.RepositoryName, tag)
 }
